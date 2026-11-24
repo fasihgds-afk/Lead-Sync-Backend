@@ -1,0 +1,634 @@
+const mongoose = require("mongoose");
+const Lead = require("../models/Lead");
+const Counter = require("../models/Counter");
+const statusCodes = require("../utils/statusCodes");
+const User = require("../models/User");
+const httpError = require("../utils/httpError");
+const asyncHandler = require("../middlewares/asyncHandler");
+
+const MAX_VERIFIER_BATCH_SIZE = 120;
+const MAX_MOVE_TO_LQ = 100000;
+const MAX_RETRIES = 3;
+
+function isValidEmailStatus(s) {
+  return ["ACTIVE", "BOUNCED", "DEAD"].indexOf(s) !== -1;
+}
+
+function isValidObjectId(id) {
+  return mongoose.Types.ObjectId.isValid(String(id || ""));
+}
+
+function buildBatchId(userId) {
+  return `VB-${String(userId)}-${Date.now()}-${new mongoose.Types.ObjectId()}`;
+}
+// 1) GET /api/verifier/leads
+// Returns only claimed DM leads having emails.
+// Does not return phone-only leads.
+const getDmLeads = asyncHandler(async function (req, res, next) {
+  const verifierId = req.user.id;
+
+  // Check if verifier already has claimed leads
+  const existingClaimCount = await Lead.countDocuments({
+    stage: "DM",
+    v_claimedBy: verifierId,
+    "emails.0": { $exists: true },
+  });
+
+  //  If already claimed → return full batch
+  if (existingClaimCount > 0) {
+    const leads = await Lead.find({
+      stage: "DM",
+      v_claimedBy: verifierId,
+      "emails.0": { $exists: true },
+    })
+      .sort({ _id: 1 })
+      .select("_id emails");
+
+    return res.status(statusCodes.OK).json({
+      success: true,
+      message: "Existing claimed batch returned.",
+      batchClaimed: false,
+      totalLeads: leads.length,
+      leads,
+    });
+  }
+
+  // Retry logic for race conditions
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const session = await mongoose.startSession();
+
+    try {
+      session.startTransaction();
+
+      // Double-check inside transaction
+      const stillHasClaimedDm = await Lead.countDocuments({
+        stage: "DM",
+        v_claimedBy: verifierId,
+        "emails.0": { $exists: true },
+      }).session(session);
+
+      if (stillHasClaimedDm > 0) {
+        await session.commitTransaction();
+        session.endSession();
+
+        const leads = await Lead.find({
+          stage: "DM",
+          v_claimedBy: verifierId,
+          "emails.0": { $exists: true },
+        })
+          .sort({ _id: 1 })
+          .select("_id emails");
+
+        return res.status(statusCodes.OK).json({
+          success: true,
+          message: "Existing claimed batch returned.",
+          batchClaimed: false,
+          totalLeads: leads.length,
+          leads,
+        });
+      }
+
+      // Count verifiers
+      const approvedVerifierCount = await User.countDocuments({
+        role: "Verifier",
+        status: "APPROVED",
+      }).session(session);
+
+      const verifierCount = Math.max(1, approvedVerifierCount);
+
+      // Count unclaimed email leads only
+      const totalUnclaimedDmLeads = await Lead.countDocuments({
+        stage: "DM",
+        "emails.0": { $exists: true },
+        $or: [{ v_claimedBy: { $exists: false } }, { v_claimedBy: null }],
+      }).session(session);
+
+      if (totalUnclaimedDmLeads === 0) {
+        await session.commitTransaction();
+        session.endSession();
+
+        return res.status(statusCodes.OK).json({
+          success: true,
+          message: "No DM email leads available to claim.",
+          batchClaimed: false,
+          totalLeads: 0,
+          leads: [],
+        });
+      }
+
+      // Batch size logic (unchanged)
+      const currentBatchSize = Math.min(
+        MAX_VERIFIER_BATCH_SIZE,
+        Math.max(1, Math.ceil(totalUnclaimedDmLeads / verifierCount)),
+      );
+
+      const counter = await Counter.findOneAndUpdate(
+        { key: "VERIFIER_BATCH_SEQ" },
+        { $inc: { seq: currentBatchSize } },
+        {
+          new: true,
+          upsert: true,
+          session,
+        },
+      );
+
+      const startSeq = counter.seq - currentBatchSize;
+
+      let leadsToClaim = await Lead.find({
+        stage: "DM",
+        "emails.0": { $exists: true },
+        $or: [{ v_claimedBy: { $exists: false } }, { v_claimedBy: null }],
+      })
+        .sort({ _id: 1 })
+        .skip(startSeq)
+        .limit(currentBatchSize)
+        .select("_id")
+        .session(session);
+
+      // Reset counter fallback
+      if (leadsToClaim.length === 0 && totalUnclaimedDmLeads > 0) {
+        await Counter.findOneAndUpdate(
+          { key: "VERIFIER_BATCH_SEQ" },
+          { $set: { seq: 0 } },
+          { session },
+        );
+
+        leadsToClaim = await Lead.find({
+          stage: "DM",
+          "emails.0": { $exists: true },
+          $or: [{ v_claimedBy: { $exists: false } }, { v_claimedBy: null }],
+        })
+          .sort({ _id: 1 })
+          .limit(currentBatchSize)
+          .select("_id")
+          .session(session);
+      }
+
+      if (leadsToClaim.length === 0) {
+        await session.commitTransaction();
+        session.endSession();
+
+        return res.status(statusCodes.OK).json({
+          success: true,
+          message: "No DM email leads available to claim.",
+          batchClaimed: false,
+          totalLeads: 0,
+          leads: [],
+        });
+      }
+
+      const now = new Date();
+      const batchId = buildBatchId(verifierId);
+
+      const bulkOps = leadsToClaim.map((lead) => ({
+        updateOne: {
+          filter: {
+            _id: lead._id,
+            stage: "DM",
+            "emails.0": { $exists: true },
+            $or: [{ v_claimedBy: { $exists: false } }, { v_claimedBy: null }],
+          },
+          update: {
+            $set: {
+              v_claimedBy: verifierId,
+              v_claimedAt: now,
+              v_batchId: batchId,
+            },
+          },
+        },
+      }));
+
+      await Lead.bulkWrite(bulkOps, { session });
+
+      await session.commitTransaction();
+      session.endSession();
+
+      // Return FULL batch (no limit)
+      const leads = await Lead.find({
+        stage: "DM",
+        v_claimedBy: verifierId,
+        "emails.0": { $exists: true },
+      })
+        .sort({ _id: 1 })
+        .select("_id emails");
+
+      return res.status(statusCodes.OK).json({
+        success: true,
+        message: "New DM batch claimed successfully.",
+        batchClaimed: true,
+        batchId,
+        totalLeads: leads.length,
+        leads,
+      });
+    } catch (error) {
+      try {
+        await session.abortTransaction();
+      } catch (_) {}
+
+      session.endSession();
+
+      if (attempt < MAX_RETRIES) continue;
+
+      return next(error);
+    }
+  }
+
+  return next(
+    httpError(
+      statusCodes.CONFLICT,
+      "Unable to claim DM leads at this time. Please try again.",
+    ),
+  );
+});
+
+// 2) POST /api/verifier/leads/:leadId/update-emails
+const updateEmailStatuses = asyncHandler(async function (req, res, next) {
+  const leadId = req.params.leadId;
+
+  if (!isValidObjectId(leadId)) {
+    return next(httpError(statusCodes.BAD_REQUEST, "Invalid leadId"));
+  }
+
+  const lead = await Lead.findById(leadId).select(
+    "stage emails v_claimedBy v_batchId",
+  );
+
+  if (!lead) {
+    return next(httpError(statusCodes.NOT_FOUND, "Lead not found"));
+  }
+
+  if (lead.stage !== "DM") {
+    return next(httpError(statusCodes.BAD_REQUEST, "Lead is not in DM stage"));
+  }
+
+  if (!lead.v_claimedBy || String(lead.v_claimedBy) !== String(req.user.id)) {
+    return next(
+      httpError(
+        statusCodes.FORBIDDEN,
+        "You can only verify leads claimed in your own batch.",
+      ),
+    );
+  }
+
+  const hasEmails = Array.isArray(lead.emails) && lead.emails.length > 0;
+  if (!hasEmails) {
+    return next(
+      httpError(statusCodes.BAD_REQUEST, "This lead has no emails to verify."),
+    );
+  }
+
+  const incomingArr = Array.isArray(req.body && req.body.emails)
+    ? req.body.emails
+    : [];
+
+  if (!incomingArr.length) {
+    return next(httpError(statusCodes.BAD_REQUEST, "Email data is required"));
+  }
+
+  const incomingMap = new Map();
+
+  for (const row of incomingArr) {
+    const norm = String(row.normalized || "")
+      .trim()
+      .toLowerCase();
+    const status = String(row.status || "")
+      .trim()
+      .toUpperCase();
+
+    if (norm && isValidEmailStatus(status)) {
+      incomingMap.set(norm, status);
+    }
+  }
+
+  const now = new Date();
+  let updatedCount = 0;
+  let missingCount = 0;
+
+  for (const e of lead.emails) {
+    const norm = String(e.normalized || "")
+      .trim()
+      .toLowerCase();
+    const nextStatus = incomingMap.get(norm);
+
+    if (!nextStatus) {
+      missingCount++;
+      continue;
+    }
+
+    e.status = nextStatus;
+    e.verifiedBy = req.user.id;
+    e.verifiedAt = now;
+    updatedCount++;
+  }
+
+  if (missingCount > 0) {
+    return res.status(statusCodes.BAD_REQUEST).json({
+      success: false,
+      message: "All emails must be updated to move lead to Verifier stage.",
+      missingCount,
+    });
+  }
+
+  lead.stage = "Verifier";
+  await lead.save();
+
+  return res.status(statusCodes.OK).json({
+    success: true,
+    message: "Lead successfully verified and moved to Verifier stage.",
+    updatedCount,
+    stage: lead.stage,
+    batchId: lead.v_batchId || "",
+  });
+});
+
+const moveAllVerifierLeadsToLQ = asyncHandler(async function (req, res, next) {
+  const requestedMoveCount = parseInt(req.body && req.body.moveCount, 10);
+
+  if (isNaN(requestedMoveCount) || requestedMoveCount < 1) {
+    return next(
+      httpError(
+        statusCodes.BAD_REQUEST,
+        "moveCount is required and must be greater than 0",
+      ),
+    );
+  }
+
+  // API load safety only
+  if (requestedMoveCount > MAX_MOVE_TO_LQ) {
+    return next(
+      httpError(
+        statusCodes.BAD_REQUEST,
+        `Cannot move more than ${MAX_MOVE_TO_LQ} leads in one API call.`,
+      ),
+    );
+  }
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const session = await mongoose.startSession();
+
+    try {
+      session.startTransaction();
+
+      const verifierId = req.user.id;
+
+      const lqs = await User.find({
+        role: "Lead Qualifiers",
+        status: "APPROVED",
+        reportsTo: { $exists: true, $ne: null },
+      })
+        .select("_id reportsTo")
+        .sort({ _id: 1 })
+        .session(session);
+
+      if (lqs.length === 0) {
+        throw httpError(
+          statusCodes.BAD_REQUEST,
+          "No approved Lead Qualifiers with assigned managers available",
+        );
+      }
+
+      const verifiedEmailQuery = {
+        stage: "Verifier",
+        //v_claimedBy: verifierId,
+        "emails.0": { $exists: true },
+      };
+
+      const phoneOnlyQuery = {
+        stage: "Verifier",
+        $or: [
+          { emails: { $exists: false } },
+          { "emails.0": { $exists: false } },
+        ],
+      };
+
+      const verifiedEmailCount = await Lead.countDocuments(
+        verifiedEmailQuery,
+      ).session(session);
+
+      const phoneOnlyCount = await Lead.countDocuments(phoneOnlyQuery).session(
+        session,
+      );
+
+      const availableLeadsCount = verifiedEmailCount + phoneOnlyCount;
+
+      if (availableLeadsCount === 0) {
+        await session.commitTransaction();
+        session.endSession();
+
+        return res.status(statusCodes.OK).json({
+          success: true,
+          message: "No leads found to move to LQ.",
+          requestedMoveCount,
+          availableLeadsCount,
+          movedCount: 0,
+        });
+      }
+
+      // Business validation
+      if (requestedMoveCount > availableLeadsCount) {
+        throw httpError(
+          statusCodes.BAD_REQUEST,
+          `Only ${availableLeadsCount} leads are available in Verifier stage.`,
+        );
+      }
+
+      // --------------------------------------------------
+      // Balanced 50/50 lead selection logic
+      // --------------------------------------------------
+      // Example:
+      // requestedMoveCount = 50 => 25 email, 25 phone
+      // requestedMoveCount = 75 => 38 email, 37 phone
+      // If one side has shortage, shortage is taken from the other side.
+      let emailTarget = Math.ceil(requestedMoveCount / 2);
+      let phoneTarget = requestedMoveCount - emailTarget;
+
+      if (verifiedEmailCount < emailTarget) {
+        const shortage = emailTarget - verifiedEmailCount;
+        emailTarget = verifiedEmailCount;
+        phoneTarget += shortage;
+      }
+
+      if (phoneOnlyCount < phoneTarget) {
+        const shortage = phoneTarget - phoneOnlyCount;
+        phoneTarget = phoneOnlyCount;
+        emailTarget += shortage;
+      }
+
+      emailTarget = Math.min(emailTarget, verifiedEmailCount);
+      phoneTarget = Math.min(phoneTarget, phoneOnlyCount);
+
+      if (emailTarget + phoneTarget !== requestedMoveCount) {
+        throw httpError(
+          statusCodes.CONFLICT,
+          `Could only prepare ${emailTarget + phoneTarget} leads. Please try again.`,
+        );
+      }
+
+      const verifiedEmailLeads =
+        emailTarget > 0
+          ? await Lead.find(verifiedEmailQuery)
+              .select("_id")
+              .sort({ _id: 1 })
+              .limit(emailTarget)
+              .session(session)
+          : [];
+
+      const phoneOnlyVerifierLeads =
+        phoneTarget > 0
+          ? await Lead.find(phoneOnlyQuery)
+              .select("_id")
+              .sort({ _id: 1 })
+              .limit(phoneTarget)
+              .session(session)
+          : [];
+
+      const leadsToMove = [...verifiedEmailLeads, ...phoneOnlyVerifierLeads];
+
+      if (leadsToMove.length !== requestedMoveCount) {
+        throw httpError(
+          statusCodes.CONFLICT,
+          `Could only prepare ${leadsToMove.length} leads. Please try again.`,
+        );
+      }
+
+      const counter = await Counter.findOneAndUpdate(
+        { key: "LQ_ASSIGN" },
+        { $inc: { seq: leadsToMove.length } },
+        {
+          new: true,
+          upsert: true,
+          session,
+          setDefaultsOnInsert: true,
+        },
+      );
+
+      const startSeq = counter.seq - leadsToMove.length;
+      const now = new Date();
+
+      const bulkOps = leadsToMove.map((lead, index) => {
+        const lqIndex = (startSeq + index) % lqs.length;
+        const assignedLqId = lqs[lqIndex]._id;
+
+        return {
+          updateOne: {
+            filter: {
+              _id: lead._id,
+              $or: [
+                {
+                  stage: "Verifier",
+                  v_claimedBy: verifierId,
+                },
+                {
+                  stage: "Verifier",
+                  $or: [
+                    { emails: { $exists: false } },
+                    { "emails.0": { $exists: false } },
+                  ],
+                },
+              ],
+            },
+            update: {
+              $set: {
+                stage: "LQ",
+                assignedTo: assignedLqId,
+                assignedToRole: "Lead Qualifiers",
+                assignedAt: now,
+                verifiedCompletedAt: now,
+              },
+              $unset: {
+                v_claimedBy: "",
+                v_claimedAt: "",
+                v_batchId: "",
+              },
+            },
+          },
+        };
+      });
+
+      const result = await Lead.bulkWrite(bulkOps, { session });
+
+      const movedCount =
+        typeof result.modifiedCount === "number"
+          ? result.modifiedCount
+          : typeof result.nModified === "number"
+            ? result.nModified
+            : 0;
+
+      if (movedCount === 0) {
+        await session.commitTransaction();
+        session.endSession();
+
+        return res.status(statusCodes.OK).json({
+          success: true,
+          message:
+            "No leads were moved. They may have already been moved by another request.",
+          requestedMoveCount,
+          movedCount: 0,
+        });
+      }
+
+      await session.commitTransaction();
+      session.endSession();
+
+      const remainingInVerifierStage = await Lead.countDocuments({
+        stage: "Verifier",
+      });
+
+      return res.status(statusCodes.OK).json({
+        success: true,
+        message: `${movedCount} leads successfully distributed to LQ.`,
+        requestedMoveCount,
+        availableLeadsCount,
+        movedCount,
+        remainingInVerifierStage,
+      });
+    } catch (error) {
+      try {
+        await session.abortTransaction();
+      } catch {}
+
+      session.endSession();
+
+      const isRetryable =
+        error &&
+        (error.code === 112 ||
+          error.codeName === "WriteConflict" ||
+          (typeof error.hasErrorLabel === "function" &&
+            (error.hasErrorLabel("TransientTransactionError") ||
+              error.hasErrorLabel("UnknownTransactionCommitResult"))));
+
+      if (isRetryable && attempt < MAX_RETRIES) {
+        continue;
+      }
+
+      return next(error);
+    }
+  }
+
+  return next(
+    httpError(
+      statusCodes.CONFLICT,
+      "Unable to move leads at this time. Please try again.",
+    ),
+  );
+});
+// GET /api/verifier/leads/verifier-count
+// Returns counts for leads in Verifier stage
+const getVerifierStageCount = asyncHandler(async function (req, res, next) {
+  const [totalVerifierStageLeads] = await Promise.all([
+    Lead.countDocuments({
+      stage: "Verifier",
+    }),
+  ]);
+
+  return res.status(statusCodes.OK).json({
+    success: true,
+    totalVerifierStageLeads,
+  });
+});
+module.exports = {
+  getDmLeads,
+  updateEmailStatuses,
+  moveAllVerifierLeadsToLQ,
+  getVerifierStageCount,
+};
